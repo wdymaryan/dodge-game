@@ -1121,7 +1121,7 @@ function stageWin() {
     runProgress(s);
     if (!s.over) stageLoad(s.nextLevel());
   } else if (s.mode === 'warm') {
-    s.cleared++; s.n++; stageHud(); stageLoad(s.nextLevel());
+    s.cleared++; s.n++; LS.set('warmLevel', s.n); stageHud(); stageLoad(s.nextLevel());
   } else if (s.mode === 'test') {
     s.won = true; s.cleared = 1; stageHud(); testCleared(s);
   } else if (s.mode === 'level') {
@@ -1384,13 +1384,29 @@ function communityPool() {
   for (const d of NET.levels) for (const id in (d.items || {})) { const it = d.items[id]; if (it && it.verified && it.rows) out.push({ ...it, id, author: d.nick || it.author || 'Player', authorId: d.uid }); }
   return out.sort((a, b) => (a.id < b.id ? -1 : 1));
 }
+function savedLevel() {
+  const local = Math.max(1, Number(LS.get('curLevel', 1)) || 1);
+  const me = NET.scores.find(s => s.uid === NET.uid);
+  const remote = me && me.level ? Math.max(1, Number(me.level) || 1) : 1;
+  return Math.max(local, remote);
+}
+function saveProgressLevel(lv) {
+  const next = Math.max(savedLevel(), Math.max(1, Number(lv) || 1));
+  LS.set('curLevel', next);
+  return next;
+}
 function champion() {
   const tally = new Map();
-  for (const dur of DURS) for (const per of ['best', 'today']) {
-    const rows = boardRows(dur, per);
-    if (rows.length) { const r = rows[0]; tally.set(r.uid, (tally.get(r.uid) || { uid: r.uid, nick: r.nick, c: 0 })); tally.get(r.uid).c++; }
-  }
-  let top = null; for (const v of tally.values()) if (!top || v.c > top.c) top = v;
+  const addTop = (rows, weight = 1) => {
+    if (!rows.length) return;
+    const r = rows[0];
+    if (!tally.has(r.uid)) tally.set(r.uid, { uid: r.uid, nick: r.nick, c: 0, w: 0 });
+    const entry = tally.get(r.uid);
+    entry.c++; entry.w += weight;
+  };
+  addTop(levelBoardRows(), 2);
+  for (const dur of DURS) for (const per of ['best', 'today']) addTop(boardRows(dur, per), 1);
+  let top = null; for (const v of tally.values()) if (!top || v.w > top.w || (v.w === top.w && v.c > top.c)) top = v;
   return top;
 }
 function featuredLevel(champUid) {
@@ -1411,40 +1427,60 @@ function startRun(st) {
   const ch = champion(); const isChamp = !!(ch && ch.uid === NET.uid);
   const issued = Date.now();
   const startedAt = issued + Math.max(1500, st.startsAt - st.issuedAt - 0);
+  const startN = savedLevel();
   const sess = {
-    mode: 'run', n: 1, cleared: 0, over: false, state: st, dur: st.dur, champ: isChamp, champUid: ch && ch.uid,
+    mode: 'run', n: startN, startN, cleared: 0, over: false, state: st, dur: st.dur, champ: isChamp, champUid: ch && ch.uid,
     startedAt, endsAt: startedAt + st.dur, seed: st.seed,
     nextLevel() { return levelFor(this.n, this.seed, this.champUid); }
   };
   goView('play');
   stageOpen(sess);
+  runProgress(sess);
 }
 function runProgress(s) {
+  saveProgressLevel(s.n);
   serial('g', () => NET.db.doc('game/state').update({ hb: ++NET.hb, cleared: s.cleared, n: s.n }));
 }
 async function runEnd(manual) {
   const s = G.sess; if (!s || s.mode !== 'run') return;
   s.over = true; stageClose(); sfx.go();
-  const n = s.cleared, dur = s.dur;
+  const n = s.cleared, dur = s.dur, reached = saveProgressLevel(s.n);
   let rankInfo = null;
   try {
-    await serial('g', () => NET.db.doc('game/state').set({ runner: null, done: true, dur, cleared: n, hb: ++NET.hb, rev: ((s.state && s.state.rev) || 0) + 1, last: { nick: NET.nick, cleared: n, dur }, issuedAt: Date.now() }));
-    await recordRun(dur, n);
+    await serial('g', () => NET.db.doc('game/state').set({ runner: null, done: true, dur, cleared: n, n: reached, hb: ++NET.hb, rev: ((s.state && s.state.rev) || 0) + 1, last: { nick: NET.nick, cleared: n, dur, level: reached }, issuedAt: Date.now() }));
+    await recordRun(dur, n, reached);
+    const lrows = levelBoardRows(); const li = lrows.findIndex(r => r.uid === NET.uid);
     const rows = boardRows(dur, 'today'); const i = rows.findIndex(r => r.uid === NET.uid);
-    rankInfo = { rank: i + 1, of: rows.length };
+    rankInfo = { rank: i + 1, of: rows.length, levelRank: li + 1, levelOf: lrows.length, level: reached };
   } catch (e) { console.warn('runEnd', e && e.code || e); }
   G.sess = null;
-  showResult(n, dur, rankInfo, manual, { d: s.deaths || 0, f: s.flawless || 0 });
+  showResult(n, dur, rankInfo, manual, { d: s.deaths || 0, f: s.flawless || 0, level: reached });
   netTick();
 }
-async function recordRun(dur, n) {
+async function recordRun(dur, n, reached) {
   const ref = NET.db.doc('scores/' + NET.uid); const snap = await ref.get(); const cur = snap.exists ? snap.data() : {};
   const d = dayKey(), k = String(dur), now = Date.now();
   const best = Object.assign({}, cur.best); if (!best[k] || n > best[k].n) best[k] = { n, at: now };
   const today = cur.today && cur.today.d === d ? Object.assign({}, cur.today) : { d };
   if (!today[k] || n > today[k].n) today[k] = { n, at: now };
-  const recent = [{ dur, n, at: now }].concat(cur.recent || []).slice(0, 12);
-  await serial('s', () => ref.set({ uid: NET.uid, nick: NET.nick, runs: (cur.runs || 0) + 1, best, today, recent }));
+  const prevLevel = Math.max(1, Number(cur.level) || 1);
+  const level = Math.max(prevLevel, Math.max(1, Number(reached) || 1));
+  const levelAt = level > prevLevel ? now : (cur.levelAt || now);
+  const totalCleared = (Number(cur.totalCleared) || 0) + n;
+  const recent = [{ dur, n, level, at: now }].concat(cur.recent || []).slice(0, 12);
+  await serial('s', () => ref.set({ uid: NET.uid, nick: NET.nick, runs: (cur.runs || 0) + 1, level, levelAt, totalCleared, best, today, recent }));
+}
+function levelBoardRows() {
+  const rows = [];
+  for (const p of NET.scores) {
+    const legacyBest = Math.max(0, ...DURS.map(d => (p.best && p.best[String(d)] && p.best[String(d)].n) || 0));
+    const level = Math.max(Number(p.level) || 0, legacyBest ? legacyBest + 1 : 0);
+    const totalCleared = Number(p.totalCleared) || legacyBest;
+    if (level > 1 || totalCleared > 0 || (p.runs || 0) > 0) {
+      rows.push({ uid: p.uid, nick: p.nick || 'Player', level: Math.max(1, level), totalCleared, at: p.levelAt || (p.recent && p.recent[0] && p.recent[0].at) || 0, runs: p.runs || 0, recent: p.recent || [] });
+    }
+  }
+  return rows.sort((a, b) => (b.level - a.level) || (b.totalCleared - a.totalCleared) || (a.at - b.at));
 }
 function boardRows(dur, period) {
   const k = String(dur), d = dayKey(), rows = [];
@@ -1547,18 +1583,20 @@ function renderPlay() {
   if (ch) {
     const f = featuredLevel(ch.uid);
     champCard = `<div class="card champ">${crownSvg('lg')}<div><div class="eyebrow">Reigning champion</div><div class="nm">${esc(ch.nick)}</div>
-      <p class="dim">Holds #1 on ${ch.c} of 6 boards. Wears the gold suit${f ? ', and their level <b>' + esc(f.name || 'Untitled') + '</b> is level 5 of every run' : ''}.</p></div></div>`;
+      <p class="dim">Holds #1 on ${ch.c} of 7 boards. Wears the gold suit${f ? ', and their level <b>' + esc(f.name || 'Untitled') + '</b> is level 5 of every run' : ''}.</p></div></div>`;
   } else {
     champCard = `<div class="card champ empty">${crownSvg('lg dim')}<div><div class="eyebrow">Champion seat</div><div class="nm">Empty</div><p class="dim">Hold #1 on the most boards to earn the gold suit, the crown, and a featured level in everyone’s run.</p></div></div>`;
   }
   const how = `<details class="card how"><summary>How a turn works</summary><ul>
     <li>One runner at a time. Clear as many levels as you can before the clock ends.</li>
     <li>Turn length depends on the line: 5 min alone, 3 min with 1–2 waiting, 1 min with 3 or more.</li>
+    <li>Your progress is saved automatically—when you join again, you resume right from the level you reached.</li>
     <li>Levels never end and get harder as you go. Everyone gets the same course each day.</li>
     <li>Every 5th level is a community level. Dying only sends you back to your last checkpoint.</li>
     <li>Dash in the air to cross wide gaps. It passes through bullets and saws, not spikes. Orbs and the ground refill it.</li>
     <li>Nobody behind you? You can run again.</li></ul></details>`;
-  const sc = `<div class="card stats"><div class="eyebrow">Your record</div><div class="pbs"><div class="pb"><b>${STATS.best}</b><span>best level</span></div><div class="pb"><b>${STATS.clears}</b><span>cleared</span></div><div class="pb"><b>${STATS.flawless}</b><span>flawless</span></div><div class="pb"><b>${STATS.deaths}</b><span>deaths</span></div></div></div>`;
+  const curLv = savedLevel();
+  const sc = `<div class="card stats"><div class="eyebrow">Your record · Next up: Level ${curLv}</div><div class="pbs"><div class="pb"><b>${Math.max(curLv, STATS.best)}</b><span>current lv</span></div><div class="pb"><b>${STATS.clears}</b><span>cleared</span></div><div class="pb"><b>${STATS.flawless}</b><span>flawless</span></div><div class="pb"><b>${STATS.deaths}</b><span>deaths</span></div></div></div>`;
   el.innerHTML = nowCard + cta + qList + champCard + sc + how;
 }
 function champCrown(uid) { const c = champion(); return c && c.uid === uid ? ' ' + crownSvg('sm') : ''; }
@@ -1582,7 +1620,7 @@ function startWarm(n0) {
   const seed = (Math.random() * 1e9) | 0;
   stageOpen({ mode: 'warm', n: n0, cleared: 0, elapsed: 0, champ: isChampMe(), nextLevel() { return genLevel(this.n, seed); } });
 }
-ACT.warm = () => { if (G.active) return; startWarm(1); };
+ACT.warm = () => { if (G.active) return; startWarm(Math.max(1, Number(LS.get('warmLevel', savedLevel())) || 1)); };
 ACT.stageLeave = () => stageLeave();
 ACT.stageExit = () => { const s = G.sess; stageClose(); G.sess = null; if (s && s.mode === 'test') goView('build'); };
 ACT.sound = () => { SFX.on = !SFX.on; LS.set('sound', SFX.on); renderHeader(); if (SFX.on) sfx.tick(); };
@@ -1590,10 +1628,11 @@ ACT.nick = () => askNick();
 ACT.view = el => goView(el.dataset.v);
 
 function showResult(n, dur, rk, manual, ex) {
-  const tag = rk && rk.rank ? `<div class="rk">#${rk.rank} <span>of ${rk.of} on today’s ${DURN[dur]} board</span></div>` : '';
-  const msg = n === 0 ? 'No levels this time. The course is the same tomorrow.' : n >= 12 ? 'That’s a serious run.' : n >= 6 ? 'Solid run.' : 'Nice start.';
-  const m = openModal(`<div class="result"><div class="eyebrow">${manual ? 'Turn ended' : 'Time'}</div><div class="bigno">${n}</div><div class="dim">level${n === 1 ? '' : 's'} cleared in ${DURN[dur]}</div>${tag}<p class="dim">${msg}</p>${ex ? `<div class="pbs"><div class="pb"><b>${ex.d}</b><span>deaths</span></div><div class="pb"><b>${ex.f}</b><span>flawless</span></div></div>` : ''}
-    <div class="col gap"><button class="btn primary big" data-r="join">Run again</button><button class="btn" data-r="build">Build a level</button><button class="btn ghost" data-r="ranks">See the leaderboard</button></div></div>`);
+  const lv = (rk && rk.level) || (ex && ex.level) || savedLevel();
+  const tag = rk && rk.levelRank ? `<div class="rk">#${rk.levelRank} <span>of ${rk.levelOf} on Highest Level (Lv ${lv})</span></div>` : (rk && rk.rank ? `<div class="rk">#${rk.rank} <span>of ${rk.of} on today’s ${DURN[dur]} board</span></div>` : '');
+  const msg = `Progress saved at Level ${lv} — you’ll pick up right here next turn.`;
+  const m = openModal(`<div class="result"><div class="eyebrow">${manual ? 'Turn ended' : 'Time'}</div><div class="bigno">${n}</div><div class="dim">level${n === 1 ? '' : 's'} cleared in ${DURN[dur]} · Now on Level ${lv}</div>${tag}<p class="dim">${msg}</p>${ex ? `<div class="pbs"><div class="pb"><b>${lv}</b><span>next level</span></div><div class="pb"><b>${ex.d}</b><span>deaths</span></div><div class="pb"><b>${ex.f}</b><span>flawless</span></div></div>` : ''}
+    <div class="col gap"><button class="btn primary big" data-r="join">Continue from Level ${lv}</button><button class="btn" data-r="build">Build a level</button><button class="btn ghost" data-r="ranks">See the leaderboard</button></div></div>`);
   m.el.addEventListener('click', e => {
     const b = e.target.closest('[data-r]'); if (!b) return; m.close();
     if (b.dataset.r === 'join') joinLine(); else if (b.dataset.r === 'build') goView('build'); else goView('ranks');
@@ -1636,13 +1675,17 @@ ACT.playLv = el => {
 };
 
 /* ---- Ranks ---- */
-const RK = { dur: LS.get('rkdur', 180000), per: LS.get('rkper', 'today') };
+const RK = { dur: LS.get('rkdur', 180000), per: LS.get('rkper', 'level') };
 function renderRanks() {
   const el = $('#v-ranks');
   const seg = (items, cur, act) => `<div class="seg" role="tablist">${items.map(([v, l]) => `<button role="tab" aria-selected="${v === cur}" class="${v === cur ? 'on' : ''}" data-act="${act}" data-v="${v}">${l}</button>`).join('')}</div>`;
   let body;
   if (!online()) body = `<div class="card off"><p class="dim">The leaderboard is shared, so it needs a signed-in view with Contributor access.</p></div>`;
-  else if (RK.per === 'recent') {
+  else if (RK.per === 'level') {
+    const rows = levelBoardRows();
+    body = rows.length ? `<div class="card flush"><ol class="rows">${rows.map((r, i) => `<li class="${r.uid === NET.uid ? 'me' : ''} ${i === 0 ? 'first' : ''}" data-act="player" data-uid="${esc(r.uid)}"><span class="rk">${i === 0 ? crownSvg('sm') : i + 1}</span><div class="rw"><b>${esc(r.nick)}${r.uid === NET.uid ? ' <span class="tag">you</span>' : ''}</b><span class="dim sm">${r.totalCleared} total cleared · ${r.runs} run${r.runs === 1 ? '' : 's'}${r.at ? ' · ' + ago(r.at) : ''}</span></div><span class="rn">${r.level}<i>level</i></span></li>`).join('')}</ol></div>`
+      : `<div class="card empty"><h3>No runners yet</h3><p class="dim">Clear levels to climb the board. Your level saves between turns.</p></div>`;
+  } else if (RK.per === 'recent') {
     const f = recentFeed();
     body = f.length ? `<div class="card flush"><ul class="rows">${f.map(r => `<li><span class="rn">${r.n}</span><div class="rw"><b>${esc(r.nick)}${champCrown(r.uid)}</b><span class="dim sm">${DURN[r.dur]} run · ${ago(r.at)}</span></div></li>`).join('')}</ul></div>` : `<div class="card empty"><h3>No runs yet</h3><p class="dim">Finished runs show up here the moment they end.</p></div>`;
   } else {
@@ -1651,17 +1694,20 @@ function renderRanks() {
       : `<div class="card empty"><h3>${RK.per === 'today' ? 'Nobody has run today' : 'No scores yet'}</h3><p class="dim">The ${DURN[RK.dur]} board is open. #1 earns a crown.</p></div>`;
   }
   const ch = champion();
-  el.innerHTML = `<div class="sectionhead"><h2>Leaderboard</h2><p class="dim">Levels cleared in a single turn. ${ch ? 'Champion: <b>' + esc(ch.nick) + '</b>.' : ''}</p></div>
-    ${RK.per !== 'recent' ? seg([[60000, '1 min'], [180000, '3 min'], [300000, '5 min']], RK.dur, 'rkdur') : ''}
-    ${seg([['today', 'Today'], ['best', 'All time'], ['recent', 'Recent']], RK.per, 'rkper')}${body}`;
+  const sub = RK.per === 'level' ? 'Highest level reached (progress saves across turns).' : 'Levels cleared in a single turn.';
+  el.innerHTML = `<div class="sectionhead"><h2>Leaderboard</h2><p class="dim">${sub} ${ch ? 'Champion: <b>' + esc(ch.nick) + '</b>.' : ''}</p></div>
+    ${RK.per !== 'recent' && RK.per !== 'level' ? seg([[60000, '1 min'], [180000, '3 min'], [300000, '5 min']], RK.dur, 'rkdur') : ''}
+    ${seg([['level', 'Highest Lv'], ['today', 'Today'], ['best', 'Best turn'], ['recent', 'Recent']], RK.per, 'rkper')}${body}`;
 }
 ACT.rkdur = el => { RK.dur = +el.dataset.v; LS.set('rkdur', RK.dur); renderRanks(); };
 ACT.rkper = el => { RK.per = el.dataset.v; LS.set('rkper', RK.per); renderRanks(); };
 ACT.player = el => {
   const p = NET.scores.find(s => s.uid === el.dataset.uid); if (!p) return;
+  const lv = Math.max(1, Number(p.level) || 1);
+  const prog = `<div class="pbs"><div class="pb"><b>${lv}</b><span>current level</span></div><div class="pb"><b>${p.totalCleared || 0}</b><span>total cleared</span></div></div>`;
   const best = DURS.map(d => `<div class="pb"><b>${p.best && p.best[d] ? p.best[d].n : '–'}</b><span>${DURN[d]} best</span></div>`).join('');
-  const rec = (p.recent || []).map(r => `<li><span class="rn">${r.n}</span><div class="rw"><span>${DURN[r.dur]} run</span><span class="dim sm">${ago(r.at)}</span></div></li>`).join('');
-  const m = openModal(`<h3>${esc(p.nick)}${champCrown(p.uid)}</h3><div class="pbs">${best}</div><div class="eyebrow">Recent runs</div><ul class="rows tight">${rec || '<li class="dim">None yet</li>'}</ul><div class="row end"><button class="btn" data-x="c">Close</button></div>`);
+  const rec = (p.recent || []).map(r => `<li><span class="rn">${r.n}</span><div class="rw"><span>${DURN[r.dur]} run${r.level ? ' · reached Lv ' + r.level : ''}</span><span class="dim sm">${ago(r.at)}</span></div></li>`).join('');
+  const m = openModal(`<h3>${esc(p.nick)}${champCrown(p.uid)}</h3>${prog}<div class="pbs">${best}</div><div class="eyebrow">Recent runs</div><ul class="rows tight">${rec || '<li class="dim">None yet</li>'}</ul><div class="row end"><button class="btn" data-x="c">Close</button></div>`);
   m.el.addEventListener('click', e => { if (e.target.closest('[data-x]')) m.close(); });
 };
 
